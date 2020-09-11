@@ -6,7 +6,7 @@
 all: compile run
 
 compile:
-	gcc main.c -o poormansChroma
+	gcc main.c -o poormansChroma -lX11
 run:
 	./poormansChroma
 
