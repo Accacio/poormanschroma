@@ -3,12 +3,14 @@
 #
 # @file
 # @version 0.1
+#
+EXE=poormansChroma
 all: compile run
 
 compile:
-	gcc main.c -o poormansChroma -lX11
+	gcc main.cpp -o $(EXE) -lX11
 run:
-	./poormansChroma
+	./$(EXE)
 
 
 # end
