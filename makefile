@@ -8,7 +8,7 @@ EXE=poormansChroma
 all: compile run
 
 compile:
-	gcc main.cpp -o $(EXE) -lX11 -lGL -lGLU -lXrender
+	gcc main.cpp -o $(EXE) -lX11 -lGL -lGLU -lXrender -lm
 run:
 	./$(EXE)
 
