@@ -18,13 +18,35 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+
 #include <sys/time.h>
 #include <time.h>
 #include <errno.h> 
 
+// Video for linux
+#include <libv4l2.h>
+#include <linux/videodev2.h>
+
+#define CAMERA_DEVICE "/dev/video0"
+
+static const GLuint WIDTH = 640;
+static const GLuint HEIGHT = 480;
 
 static unsigned long last_time;
 
+void saveJpg(void* buffer,int length){
+    int jpgfile;
+    if((jpgfile = open("/tmp/myimage.jpeg", O_WRONLY | O_CREAT, 0660)) < 0){
+        perror("open");
+        exit(1);
+    }
+    write(jpgfile, buffer, length);
+    close(jpgfile);
+}
 
 unsigned long get_nanos() {
     struct timespec ts;
@@ -145,11 +167,11 @@ const char *cubeFragmentShaderSource = "#version 330 core\n"
     "out vec4 FragColor;\n"
     "in vec4 ourColor;\n"
     // "in vec2 TexCoord;\n"
-    // "uniform sampler2D ourTexture;\n"
+    // "uniform sampler2D continuousTexture;\n"
 // "in vec4 vertexColor;\n"
     "void main()\n"
     "{\n"
-    // "    FragColor = texture(ourTexture,TexCoord);\n"
+    // "    FragColor = texture(continuousTexture,TexCoord);\n"
     "    FragColor = ourColor;\n"
     // "    FragColor = vec4(1.0f,0.5f,0.2f,1.0f);\n"
     "}";
@@ -158,10 +180,10 @@ const char *cubeFragmentShaderSource = "#version 330 core\n"
 
 float cameraVertices[] = {
 /*  xy            uv */
-    1.0,  1.0,   0.0, 1.0,
-     1.0,  -1.0,   0.0, 0.0,
-     -1.0, -1.0,   1.0, 0.0,
-    -1.0, 1.0,   1.0, 1.0,
+     1.0,  1.0,  0.0,  0.0,    // Top right
+     1.0, -1.0,  0.0,  1.0,  // bottom left
+    -1.0, -1.0,  1.0,  1.0,  // bottom left
+    -1.0,  1.0,  1.0,  0.0,    // Top left
 };
 unsigned int cameraIndices[] = {
     0, 1, 3,
@@ -169,22 +191,35 @@ unsigned int cameraIndices[] = {
 };
 
 const char *cameraVertexShaderSource = "#version 330 core\n"
-    "in vec2 coord2d;\n"
+    "in vec2 vertexCoord2d;\n"
     "in vec2 vertexUv;\n"
     "out vec2 fragmentUv;\n"
     "void main() {\n"
-    "    gl_Position = vec4(coord2d, -1.0f, 1.0f);\n"
+    "    gl_Position = vec4(vertexCoord2d, 0.0f, 1.0f);\n"
     "    fragmentUv = vertexUv;\n"
     "}\n";
 
 const char *cameraFragmentShaderSource = "#version 330 core\n"
-    "out vec4 FragColor;\n"
     "in vec2 fragmentUv;\n"
-    // "uniform sampler2D ourTexture;\n"
+    "out vec4 FragColor;\n"
+    "uniform sampler2D continuousTexture;\n"
+    "uniform sampler2D comparisonTexture;\n"
+    "vec4 ourcolor;\n"
+    "vec4 othercolor;\n"
+    "vec4 errColor;\n"
+    "vec4 color;\n"
     "void main()\n"
     "{\n"
-    // "    FragColor = texture(ourTexture,TexCoord);\n"
-    "    FragColor = vec4(0.5f,0.7f,1.0f,1f);\n"
+    "    float eps = 0.2f;"
+    "    ourcolor = vec4(texture(continuousTexture,fragmentUv.xy).rgb,1.0f);\n"
+    "    othercolor = vec4(texture(comparisonTexture,fragmentUv.xy).rgb,1.0f);\n"
+    "    errColor=ourcolor-othercolor;"
+    "    color = ourcolor;\n"
+    "    if((abs(errColor).r<eps)&& (abs(errColor).g<eps)&& (abs(errColor).b<eps))"
+    "    {color=vec4(0.0f);}"
+    "    FragColor = color;\n"
+    // "    FragColor = vec4(fragmentUv.xy,1.0f,1.0f);\n"
+    // "    FragColor = vec4(0.5f,0.7f,1.0f,1f);\n"
     // "    FragColor = vec3(0.5f,0.2f,1.0f);\n"
     "}";
 
@@ -213,7 +248,6 @@ unsigned int getProgram(const char*vertexShaderSource, const char*fragmentShader
         printf("Error Shader compilation %s\n",infoLog);
     }
 
-
     unsigned int id;
     id = glCreateProgram();
     glAttachShader(id, vertexShader);
@@ -232,10 +266,14 @@ unsigned int getProgram(const char*vertexShaderSource, const char*fragmentShader
 
 
 int main(int argc, char *argv[]) {
+
+    uint8_t *image;
+    uint8_t *image2;
+
     Display* display = XOpenDisplay(NULL);
     if (!display){
-        // could not connect to X
-        exit(0);
+        perror("could not connect to X");
+        exit(1);
     }
     Window xroot = DefaultRootWindow(display);
 
@@ -289,7 +327,7 @@ int main(int argc, char *argv[]) {
     // attr.event_mask = KeyPressMask;
     Window window = XCreateWindow(display,
                                   xroot,
-                                  10, 10, 500, 500,
+                                  10, 10, WIDTH, HEIGHT,
                                   0,
                                   visual->depth,
                                   // vinfo.depth,
@@ -331,6 +369,87 @@ int main(int argc, char *argv[]) {
 
     glXMakeContextCurrent(display, window, window, render_context);
 
+    // open file descriptor
+    int cameraFd = v4l2_open(CAMERA_DEVICE,O_RDWR);
+
+    // get camera capabilities
+    struct v4l2_capability cameraCapability;
+    v4l2_ioctl(cameraFd,VIDIOC_QUERYCAP,&cameraCapability);
+    // verify if we can stream
+    if(!(cameraCapability.capabilities & V4L2_CAP_STREAMING)){
+        perror("Oops, Camera can't stream");
+        exit(1);
+    }
+
+    // set image format
+    struct v4l2_format cameraImageFormat;
+    cameraImageFormat.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    // cameraImageFormat.fmt.pix.pixelformat = V4L2_PIX_FMT_MJPEG;
+    cameraImageFormat.fmt.pix.pixelformat = V4L2_PIX_FMT_RGB24;
+    cameraImageFormat.fmt.pix.field       = V4L2_FIELD_INTERLACED;
+    cameraImageFormat.fmt.pix.width = WIDTH;
+    cameraImageFormat.fmt.pix.height = HEIGHT;
+
+    // // send format to camera
+    if(v4l2_ioctl(cameraFd,VIDIOC_S_FMT, &cameraImageFormat)<0){
+        perror("Oops, Can't use this format");
+        exit(1);
+    }
+
+    // // set buffer request
+    struct v4l2_requestbuffers cameraRequestBuffers;
+    cameraRequestBuffers.count = 1;
+    cameraRequestBuffers.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    cameraRequestBuffers.memory = V4L2_MEMORY_MMAP;
+
+    // // request buffer
+    if(v4l2_ioctl(cameraFd, VIDIOC_REQBUFS,&cameraRequestBuffers)<0){
+        perror("Oops, Can't set buffers");
+        exit(1);
+    }
+
+    // // get buffer info size and all
+    struct v4l2_buffer cameraBufferInfo;
+    // clear data
+    memset(&cameraBufferInfo, 0, sizeof(cameraBufferInfo));
+
+    cameraBufferInfo.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    cameraBufferInfo.memory = V4L2_MEMORY_MMAP;
+    cameraBufferInfo.index = 0;
+
+    // query buffer info
+    if(v4l2_ioctl(cameraFd, VIDIOC_QUERYBUF,&cameraBufferInfo)<0){
+        perror("Oops, can't query buffers");
+        exit(1);
+    }
+
+    // // map camera to memory
+    void * cameraImage;
+    cameraImage = v4l2_mmap(NULL,
+                       cameraBufferInfo.length,
+                       PROT_READ | PROT_WRITE,
+                       MAP_SHARED,
+                       cameraFd,
+                       cameraBufferInfo.m.offset);
+
+    if(cameraImage==MAP_FAILED){
+        perror("Oops, could not map device");
+        exit(1);
+    }
+    memset(cameraImage, 0, cameraBufferInfo.length);
+
+    // // Activate streaming
+    int type = cameraBufferInfo.type;
+    if(v4l2_ioctl(cameraFd, VIDIOC_STREAMON, &type) < 0){
+        perror("VIDIOC_STREAMON");
+        exit(1);
+    }
+
+    if(v4l2_ioctl(cameraFd, VIDIOC_QBUF, &cameraBufferInfo) < 0){
+        perror("VIDIOC_QBUF");
+        exit(1);
+    }
+
     XMapWindow(display, window);
 
     // glXcontext= glXCreateNewContext(display, pvinfo, GLX_RGBA_TYPE, 0, True);
@@ -362,6 +481,19 @@ int main(int argc, char *argv[]) {
     glEnableVertexArrayAttrib(cubeVAO, 1);
     glBindVertexArray(0);
 
+    unsigned int texture;
+    unsigned int texture2;
+    glGenTextures(1, &texture);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+
+    glGenTextures(1, &texture2);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, texture2);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 
 
     glGenBuffers( 1, &cameraVBO);
@@ -374,10 +506,10 @@ int main(int argc, char *argv[]) {
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(cameraIndices), cameraIndices, GL_STATIC_DRAW);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 
-    unsigned int coord2d_location = glGetAttribLocation(idCamera, "coord2d");
+    unsigned int coord2d_location = glGetAttribLocation(idCamera, "vertexCoord2d");
     unsigned int vertexUv_location = glGetAttribLocation(idCamera, "vertexUv");
-	// unsigned int myTextureSampler_location = glGetUniformLocation(idCamera, "myTextureSampler");
-	// unsigned int pixD_location = glGetUniformLocation(idCamera, "pixD");
+	unsigned int continuousImage_location = glGetUniformLocation(idCamera, "continuousTexture");
+	unsigned int compareImage_location = glGetUniformLocation(idCamera, "comparisonTexture");
 
     glGenVertexArrays(1, &cameraVAO);
     glBindVertexArray(cameraVAO);
@@ -402,7 +534,6 @@ int main(int argc, char *argv[]) {
     struct timeval endFrame;
     long int ms, elapsed=0;
 
-
     init_fps();
     while(True) {
         // Event Loop
@@ -416,7 +547,7 @@ int main(int argc, char *argv[]) {
                     printf("Event Expose Received\n");
                     XWindowAttributes       gwa;
                     XGetWindowAttributes(display, window, &gwa);
-                    glViewport(0, 0, gwa.width, gwa.height);
+                    glViewport(0, 0, gwa.width, gwa.width*HEIGHT/WIDTH);
                     break;
                     // case ClientMessage:
                     //     if (event.xclient.data.l[0] == del_atom)
@@ -432,8 +563,46 @@ int main(int argc, char *argv[]) {
                         // glXDestroyContext(display, glXcontext);
                         // XDestroyWindow(display, window);
                         // XCloseDisplay(display);
+                        printf("Shutting down now!!!\n");
                         exit(0);
                     }
+                    if (XLookupKeysym(&event.xkey, 0) == XK_Return)
+                    {
+
+
+                        memset(cameraImage, 0, cameraBufferInfo.length);
+                        cameraBufferInfo.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+                        cameraBufferInfo.memory = V4L2_MEMORY_MMAP;
+                        // put camera image in a texture
+                        if(v4l2_ioctl(cameraFd, VIDIOC_DQBUF, &cameraBufferInfo) < 0){
+                            perror("VIDIOC_DQBUF");
+                            exit(1);
+                        }
+                        if(v4l2_ioctl(cameraFd, VIDIOC_QBUF, &cameraBufferInfo) < 0){
+                            perror("VIDIOC_QBUF");
+                            exit(1);
+                        }
+
+
+                        image2 = (uint8_t *) cameraImage;
+
+                        glActiveTexture(GL_TEXTURE1);
+                        glTexImage2D(
+                            GL_TEXTURE_2D, 0, GL_RGB, 640, 480,
+                            // 0, GL_RGB, GL_UNSIGNED_BYTE, (uint8_t*) cameraImage
+                            0, GL_RGB, GL_UNSIGNED_BYTE, image2
+                                     );
+
+                        // glXMakeCurrent(display, None, NULL);
+                        // glXDestroyContext(display, glXcontext);
+                        // XDestroyWindow(display, window);
+                        // XCloseDisplay(display);
+                        printf("Changing Image!!!\n");
+                        // exit(0);
+                    }
+                    break;
+                case ClientMessage:
+                    if(event.xclient.data.l[0] == wm_delete_window) exit(0);
                     break;
                 default:
                     printf("Event Received\n");
@@ -441,9 +610,13 @@ int main(int argc, char *argv[]) {
             }
         }
 
+
+
         glClearColor(0.0, 0.0, 0.0, 0.0);
         // glClear(GL_COLOR_BUFFER_BIT| GL_DEPTH_BUFFER_BIT);
         glClear(GL_COLOR_BUFFER_BIT);
+
+
 
         glm::mat4 projection = glm::mat4(1.0f);
         // projection = glm::ortho(0.0f, 800.0f, 0.0f, 600.0f, 0.1f, 100.0f);
@@ -453,7 +626,7 @@ int main(int argc, char *argv[]) {
         // printf("%f\n",(double) uptime);
         // printf("%lu\n", );
 
-        model = glm::rotate(model, glm::radians((float) 10.0f*(get_milis()/100%10000)), glm::vec3(1.0f, 1.0f, 0.0f));
+        model = glm::rotate(model, glm::radians((float) 5.0f*(get_milis()/100%100000)), glm::vec3(1.0f, 1.0f, 0.0f));
 
         glm::mat4 view= glm::mat4(1.0f);
         view = glm::translate(view, glm::vec3(0.0f, 0.0f, -3.0f));
@@ -463,8 +636,31 @@ int main(int argc, char *argv[]) {
         glUniformMatrix4fv(glGetUniformLocation(idCube, "view"), 1, GL_FALSE, &view[0][0]);
         glUniformMatrix4fv(glGetUniformLocation(idCube, "projection"), 1, GL_FALSE, &projection[0][0]);
 
+        // clean image
+        memset(cameraImage, 0, cameraBufferInfo.length);
+
+        // get camera Image
+        if(v4l2_ioctl(cameraFd, VIDIOC_DQBUF, &cameraBufferInfo) < 0){
+            perror("VIDIOC_DQBUF");
+            exit(1);
+        }
+        if(v4l2_ioctl(cameraFd, VIDIOC_QBUF, &cameraBufferInfo) < 0){
+            perror("VIDIOC_QBUF");
+            exit(1);
+        }
+
+        // put camera image in a texture
+        glActiveTexture(GL_TEXTURE0);
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_RGB, 640, 480,
+            // 0, GL_RGB, GL_UNSIGNED_BYTE, (uint8_t*) cameraImage
+            0, GL_RGB, GL_UNSIGNED_BYTE, cameraImage
+        );
+
         // Draw Camera
         glUseProgram(idCamera);
+        glUniform1i(continuousImage_location, 0);
+        glUniform1i(compareImage_location, 1);
         glBindVertexArray(cameraVAO);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
@@ -472,27 +668,15 @@ int main(int argc, char *argv[]) {
        
         glClear(GL_DEPTH_BUFFER_BIT);
         // // Draw Cube
-        glUseProgram(idCube);
-        glBindVertexArray(cubeVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 36);
-        glBindVertexArray(0);
+        // glUseProgram(idCube);
+        // glBindVertexArray(cubeVAO);
+        // glDrawArrays(GL_TRIANGLES, 0, 36);
+        // glBindVertexArray(0);
 
-
+        print_fps();
 
         // Swap Buffers
         glXSwapBuffers(display, window);
-
-        gettimeofday(&endFrame, NULL);
-        ms = endFrame.tv_sec * 1000 + endFrame.tv_usec / 1000 -( beginFrame.tv_sec * 1000 + beginFrame.tv_usec / 1000);
-        elapsed +=ms;
-
-        // printf("elapsed: %f\n",(float) elapsed);
-
-        // printf("FPS: %f\n",(float) 1000/ms);
-        print_fps();
-
-
-
     }
     return 0;
 }
